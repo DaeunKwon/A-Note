@@ -512,10 +512,16 @@ def _fallback_analysis(trade: TradeRecord, pnl_pct):
 
 # ── 정적 파일 (프론트엔드) ───────────────────────────
 STATIC_DIR = BASE_DIR / "static"
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/")
 async def root():
+    if not STATIC_DIR.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="static directory not found in deployment bundle",
+        )
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
