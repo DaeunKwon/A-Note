@@ -14,10 +14,12 @@ import json
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, List
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 app = FastAPI(title="A-Note API")
 
@@ -509,11 +511,12 @@ def _fallback_analysis(trade: TradeRecord, pnl_pct):
 
 
 # ── 정적 파일 (프론트엔드) ───────────────────────────
-app.mount("/static", StaticFiles(directory="static"), name="static")
+STATIC_DIR = BASE_DIR / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.get("/")
 async def root():
-    return FileResponse("static/index.html")
+    return FileResponse(str(STATIC_DIR / "index.html"))
 
 
 # ── 웹소켓: 실시간 시세 스트림 ───────────────────────
