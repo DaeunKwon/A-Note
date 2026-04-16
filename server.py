@@ -3,6 +3,8 @@ A-Note 백엔드 서버
 FastAPI + KIS API + 네이버 뉴스 API + Google Gemini AI
 """
 
+from __future__ import annotations
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,7 +13,10 @@ from pydantic import BaseModel
 import httpx
 import asyncio
 import json
+import logging
 import os
+import sys
+import traceback
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +25,23 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("anote")
+if not logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(_h)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+
+
+def _stderr_log_news_gemini(trade_name: str, err: BaseException) -> None:
+    """uvicorn 로깅과 무관하게 터미널에 원인 출력."""
+    sys.stderr.write(f"\n[A-Note] 뉴스 Gemini 실패 — 종목: {trade_name}\n")
+    sys.stderr.write(f"  {type(err).__name__}: {err}\n")
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
 
 app = FastAPI(title="A-Note API")
 
@@ -37,7 +59,17 @@ KIS_ACCOUNT      = os.getenv("KIS_ACCOUNT", "")          # 예: 12345678-01
 KIS_IS_VIRTUAL   = os.getenv("KIS_IS_VIRTUAL", "true").lower() == "true"
 NAVER_CLIENT_ID  = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
+
+
+def _clean_env_secret(name: str) -> str:
+    v = os.getenv(name, "") or ""
+    v = v.strip().strip('"').strip("'")
+    if v.startswith("\ufeff"):
+        v = v.lstrip("\ufeff").strip()
+    return v
+
+
+GEMINI_API_KEY = _clean_env_secret("GEMINI_API_KEY")
 
 KIS_BASE = "https://openapivts.koreainvestment.com:29443" if KIS_IS_VIRTUAL \
            else "https://openapi.koreainvestment.com:9443"
@@ -292,6 +324,290 @@ async def enrich_news_items(items: List[dict]) -> None:
         await _enrich_news_batch_gemini(items[i : i + batch_size])
 
 
+def _parse_naver_news_row(item: dict) -> dict:
+    """네이버 뉴스 API 한 건 → 정규화 (태그 제거, 감성 키워드)."""
+    title = (
+        item["title"]
+        .replace("<b>", "")
+        .replace("</b>", "")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+    )
+    desc = (
+        item["description"]
+        .replace("<b>", "")
+        .replace("</b>", "")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+    )
+    neg_kw = ["하락", "급락", "손실", "악재", "우려", "위기", "감소", "침체", "폭락"]
+    pos_kw = ["상승", "급등", "호재", "기대", "성장", "증가", "돌파", "신고가", "회복"]
+    sentiment = "neutral"
+    for k in neg_kw:
+        if k in title:
+            sentiment = "negative"
+            break
+    if sentiment == "neutral":
+        for k in pos_kw:
+            if k in title:
+                sentiment = "positive"
+                break
+    return {
+        "title": title,
+        "description": desc,
+        "link": item["link"],
+        "pubDate": item["pubDate"],
+        "sentiment": sentiment,
+    }
+
+
+async def fetch_naver_news_raw(query: str, display: int = 8) -> List[dict]:
+    """네이버 뉴스 검색 (Gemini 보강 없음). 오답 노트·분석용."""
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return []
+    try:
+        headers = {
+            "X-Naver-Client-Id": NAVER_CLIENT_ID,
+            "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                "https://openapi.naver.com/v1/search/news.json",
+                params={"query": query, "display": min(display, 10), "sort": "date"},
+                headers=headers,
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+        return [_parse_naver_news_row(item) for item in data.get("items", [])]
+    except Exception:
+        return []
+
+
+def _news_headlines_from_items(items: List[dict], limit: int = 5) -> List[dict]:
+    return [{"title": it.get("title", ""), "link": it.get("link", "")} for it in items[:limit]]
+
+
+def _fallback_news_actions(
+    trade: TradeRecord,
+    items: List[dict],
+    *,
+    gemini_status: str = "missing",
+) -> dict:
+    """Gemini/뉴스 실패 시: 뉴스 제목·스니펫만으로 짧은 안내.
+
+    gemini_status: 'missing' = 서버에 키 없음 | 'failed' = 키는 있는데 API/파싱 실패
+    """
+    heads = _news_headlines_from_items(items, 5)
+    if not items:
+        return {
+            "newsOutlook": (
+                f"「{trade.stockName}」 관련 최신 뉴스를 가져오지 못했습니다. "
+                "서버에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET이 설정돼 있는지, "
+                "네트워크 상태를 확인해 주세요."
+            ),
+            "newsActions": [
+                {
+                    "title": "손절·목표가만 먼저 적기",
+                    "desc": "뉴스와 관계없이 다음 거래 전에 감당 가능한 손실 한도와 목표를 메모해 두세요.",
+                },
+                {
+                    "title": "공시·실적 일정 확인",
+                    "desc": "증권사 앱에서 해당 종목의 공시 알림을 켜 두면 급변할 때 도움이 됩니다.",
+                },
+                {
+                    "title": "감정 매매 줄이기",
+                    "desc": "뉴스 한 줄에 바로 매매하지 말고, 하루 한 번만 시장과 뉴스를 점검하는 습관을 권합니다.",
+                },
+            ],
+            "newsHeadlines": [],
+        }
+    lines = []
+    for it in items[:4]:
+        t = (it.get("title") or "")[:120]
+        if t:
+            lines.append(t)
+    joined = " ".join(lines)[:500]
+    if gemini_status == "failed":
+        suffix = (
+            "이번에는 AI 자동 해석을 불러오지 못했습니다. "
+            "네트워크·API 한도·모델 응답 형식 문제일 수 있으니 잠시 후 다시 시도하거나, 아래 기사 링크를 참고해 주세요."
+        )
+    else:
+        suffix = (
+            "서버가 GEMINI_API_KEY를 읽지 못했습니다. "
+            "프로젝트 루트의 .env에 넣은 뒤 **서버를 완전히 종료했다가 다시 실행**해 주세요. "
+            "(파일만 저장하고 브라우저만 새로고침하는 것으로는 적용되지 않습니다.)"
+        )
+    return {
+        "newsOutlook": (
+            f"최근 검색된 뉴스 제목·요약을 바탕으로 보면, {trade.stockName}에 대한 시장의 관심이 반영돼 있습니다. "
+            f"(요약 키워드: {joined}"
+            + ("…" if len(joined) >= 500 else "")
+            + ") "
+            + suffix
+        ),
+        "newsActions": [
+            {
+                "title": "아래 기사 원문 읽기",
+                "desc": "제목만 보고 판단하지 말고, 링크에서 전체 맥락을 확인해 보세요.",
+            },
+            {
+                "title": "뉴스와 차트 시점 맞추기",
+                "desc": f"이번 체결 시점({trade.tradeTime}) 전후로 주가·거래량 변화를 다시 보면 패턴이 보입니다.",
+            },
+            {
+                "title": "규칙대로만 추가 매매",
+                "desc": "호재·악재에 휘둘리지 말고, 미리 정한 손절·익절선을 우선하세요.",
+            },
+        ],
+        "newsHeadlines": heads,
+    }
+
+
+def _parse_news_json_from_model_text(raw: str) -> dict:
+    """모델이 마크다운·앞뒤 잡담과 섞어 보낸 경우까지 완화적으로 JSON만 추출."""
+    t = (raw or "").strip()
+    if not t:
+        raise ValueError("모델 응답 텍스트가 비었습니다.")
+    if "```" in t:
+        t = t.split("```", 1)[1]
+        if t.startswith("json"):
+            t = t[4:]
+        t = t.strip()
+        if "```" in t:
+            t = t[: t.rfind("```")].strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        s, e = t.find("{"), t.rfind("}")
+        if s >= 0 and e > s:
+            return json.loads(t[s : e + 1])
+        raise ValueError(f"JSON 파싱 실패 (앞 400자): {t[:400]!r}") from None
+
+
+async def gemini_news_recommendation(trade: TradeRecord, items: List[dict]) -> dict:
+    """
+    네이버 뉴스 스니펫을 바탕으로 단기 시장 해석(참고용) + 다음 행동 3가지.
+    투자 조언이 아닌 교육·복기 목적 문구로 유도.
+    """
+    if not items:
+        return _fallback_news_actions(trade, [])
+    if not GEMINI_API_KEY:
+        return _fallback_news_actions(trade, items, gemini_status="missing")
+
+    payload_in = []
+    for it in items[:8]:
+        payload_in.append(
+            {
+                "title": (it.get("title") or "")[:220],
+                "snippet": (it.get("description") or "")[:320],
+            }
+        )
+
+    learned = trade.totalTradesLearned
+    prompt = f"""당신은 한국 주식 시장을 초보에게 설명하는 AI 코치입니다. 아래는 '{trade.stockName}' 종목과 연관된 **최근 뉴스 검색 결과**입니다.
+김한화 님의 이번 매매 맥락과 뉴스를 **함께** 보고, JSON만 출력하세요. 마크다운·머리말 금지.
+
+## 김한화 님 이번 매매 (참고)
+- 종목: {trade.stockName} ({trade.stockCode})
+- 유형: {"매수" if trade.tradeType == "buy" else "매도"}
+- 체결가: {trade.price:,}원, 수량 {trade.qty}주
+- 체결 시각: {trade.tradeTime}
+- 앱에 쌓인 매매 기록: 총 {learned}건
+
+## 뉴스 목록 (검색 시점 기준, 최신순)
+{json.dumps(payload_in, ensure_ascii=False)}
+
+## 출력 JSON 형식 (필드만 이 이름으로)
+{{
+  "newsOutlook": "뉴스 내용에 근거해 이 종목·관련 업종의 **단기적인 기대 심리·리스크**를 쉬운 말로 3~5문장. "
+                 "반드시 뉴스에 나온 사실·키워드를 언급하고, '확실한 수익을 보장한다' 같은 표현은 금지. "
+                 "마지막에 '참고용이며 투자 권유가 아니다'에 가까운 한 문장을 넣을 것.",
+  "newsActions": [
+    {{"title": "짧은 제목(15자 내외)", "desc": "뉴스와 이번 매매를 엮은 구체적 다음 행동(초보용)"}},
+    {{"title": "...", "desc": "..."}},
+    {{"title": "...", "desc": "..."}}
+  ]
+}}
+
+## 절대 금지
+- 뉴스에 없는 사실 지어내기
+- 모든 종목에 같은 일반론만 반복하기
+- newsActions 3개 미만
+"""
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.35,
+                    "maxOutputTokens": 1536,
+                },
+            },
+            timeout=45,
+        )
+    try:
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        body = (e.response.text or "")[:1200]
+        raise RuntimeError(f"Gemini HTTP {e.response.status_code}: {body}") from e
+
+    result = r.json()
+    if isinstance(result, dict) and result.get("error"):
+        raise RuntimeError(f"Gemini API error 필드: {result.get('error')}")
+    candidates = result.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(
+            "Gemini 응답에 candidates가 없습니다(할당량·차단·모델 오류 가능). "
+            f"응답 일부: {json.dumps(result, ensure_ascii=False)[:1500]}"
+        )
+    cand0 = candidates[0]
+    parts = (cand0.get("content") or {}).get("parts") or []
+    if not parts:
+        fr = cand0.get("finishReason", "")
+        raise RuntimeError(
+            "Gemini가 본문을 반환하지 않았습니다(SAFETY 등). "
+            f"finishReason={fr!r} candidate={json.dumps(cand0, ensure_ascii=False)[:900]}"
+        )
+    raw = (parts[0].get("text") or "").strip()
+    data = _parse_news_json_from_model_text(raw)
+    outlook = (data.get("newsOutlook") or "").strip()
+    acts = data.get("newsActions")
+    if not outlook or not isinstance(acts, list) or len(acts) < 3:
+        raise ValueError("invalid news AI shape")
+    clean_actions = []
+    for a in acts[:5]:
+        if not isinstance(a, dict):
+            continue
+        t = (a.get("title") or "").strip()
+        d = (a.get("desc") or "").strip()
+        if t and d:
+            clean_actions.append({"title": t[:80], "desc": d[:400]})
+    if len(clean_actions) < 3:
+        raise ValueError("not enough actions")
+    return {
+        "newsOutlook": outlook[:2000],
+        "newsActions": clean_actions[:3],
+        "newsHeadlines": _news_headlines_from_items(items, 5),
+    }
+
+
+async def gemini_news_recommendation_safe(trade: TradeRecord, items: List[dict]) -> dict:
+    """뉴스 기반 AI 해석. 실패 시 예외 대신 키 유무에 맞는 fallback 반환."""
+    tname = getattr(trade, "stockName", "?")
+    try:
+        return await gemini_news_recommendation(trade, items)
+    except Exception as e:
+        _stderr_log_news_gemini(tname, e)
+        logger.warning("뉴스 기반 Gemini 분석 실패 (%s): %s", tname, e, exc_info=True)
+        if GEMINI_API_KEY:
+            return _fallback_news_actions(trade, items, gemini_status="failed")
+        return _fallback_news_actions(trade, items, gemini_status="missing")
+
+
 # ── 뉴스 조회 ─────────────────────────────────────────
 @app.get("/api/news")
 async def get_news(query: str = "주식 증시 코스피"):
@@ -362,11 +678,12 @@ class TradeRecord(BaseModel):
 
 @app.post("/api/analyze")
 async def analyze_trade(trade: TradeRecord):
-    try:
-        pnl_pct = None
-        if trade.avgPrice and trade.avgPrice > 0:
-            pnl_pct = round((trade.price - trade.avgPrice) / trade.avgPrice * 100, 2)
+    pnl_pct = None
+    if trade.avgPrice and trade.avgPrice > 0:
+        pnl_pct = round((trade.price - trade.avgPrice) / trade.avgPrice * 100, 2)
 
+    main: dict = {}
+    try:
         learned = trade.totalTradesLearned
         prompt = f"""
 당신은 개인 투자자의 매매를 사후 분석하는 AI 투자 코치입니다.
@@ -432,17 +749,22 @@ async def analyze_trade(trade: TradeRecord):
             result = r.json()
 
         raw = result["candidates"][0]["content"]["parts"][0]["text"]
-        # JSON 블록 추출
         raw = raw.strip()
         if "```" in raw:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        return json.loads(raw.strip())
+        main = json.loads(raw.strip())
+    except Exception:
+        main = _fallback_analysis(trade, pnl_pct)
 
-    except Exception as e:
-        # Gemini 실패 시 fallback 분석
-        return _fallback_analysis(trade, pnl_pct)
+    news_items = await fetch_naver_news_raw(f"{trade.stockName} 주식", display=8)
+    news_block = await gemini_news_recommendation_safe(trade, news_items)
+
+    news_block["newsFetchedAt"] = datetime.now().isoformat(timespec="seconds")
+    if isinstance(main, dict):
+        main.update(news_block)
+    return main
 
 
 def _fallback_analysis(trade: TradeRecord, pnl_pct):
