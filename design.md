@@ -50,8 +50,9 @@
 
 ### 4.3 Google Gemini
 
-- 모델: `gemini-2.5-flash` (매매 분석 `/api/analyze`, 뉴스 배치 보강)
+- 모델: `gemini-2.5-flash` (매매 분석 `/api/analyze`, 뉴스 배치 보강, 오답 노트 2번 뉴스 해석)
 - 매매 분석: JSON 스키마(점수, 분석문, 액션, 총평, 패턴 등) 준수, 실패 시 `_fallback_analysis` 룰 기반 응답
+- 뉴스 해석: `newsOutlook`, `newsActions`, `newsHeadlines`를 반환하며, Gemini 실패 시 키 유무/실패 사유에 맞는 폴백 메시지 사용
 
 ---
 
@@ -64,7 +65,7 @@
 | `GET /api/chart/{code}` | 일봉(및 period 파라미터) |
 | `GET /api/index` | KOSPI / KOSDAQ 지수 |
 | `GET /api/news?query=…` | 네이버 뉴스 + AI 보강 필드 |
-| `POST /api/analyze` | `TradeRecord` 바디 → Gemini 분석 JSON |
+| `POST /api/analyze` | `TradeRecord` 바디 → 매매 분석 + 종목 뉴스 기반 해석 JSON |
 | `GET /static/*` | 정적 자원 |
 | `WS /ws/prices` | 5초 간격 다종목 시세 브로드캐스트 (**로컬 전제**; Vercel 서버리스에서는 일반적으로 사용 불가) |
 
@@ -83,8 +84,9 @@
 ### 6.2 주요 기능 흐름
 
 - **주문 탭**: 종목 선택 → 차트·지표 → 매수/매도 입력(수량·가격 유효성: 양의 정수 등)
-- **매매 내역**: 누적 체결 목록, 항목 클릭 시 A-Note(오답 노트) — **이미 저장된 `anoteAnalysis`가 있으면 재요청 없이 표시**
-- **투자 성향**: 체결 이력 기반 클라이언트 측 MBTI 유사 프로필 + 유형별 마스코트(이모지) 단일 표시
+- **매매 내역**: 누적 체결 목록, 항목 클릭 시 A-Note(오답 노트) — 저장된 `anoteAnalysis`가 있으면 재요청 없이 표시
+- **오답 노트 2번**: 종목 관련 네이버 뉴스를 기반으로 시장 해석 + 다음 행동 추천(참고 기사 링크 포함)
+- **투자 성향**: 누적 체결 기반 MBTI 유사 프로필 + 유형별 마스코트 + 성향 변화 추적 + 행동 패턴 추천
 
 ### 6.3 API 베이스 URL
 
@@ -94,12 +96,14 @@
 
 ## 7. 데이터·상태 모델 (클라이언트)
 
-`anote_trade_state_v4`에 대략 다음이 포함된다.
+`anote_trade_state_v4`와 `anote_profile_history_v1`에 대략 다음이 포함된다.
 
 - 누적 **체결 기록**(종목, 수량, 가격, 시각 등)
+- 종목별 **다중 보유 상태**(`holdings`: 수량, 평균단가)
 - 거래별 **A-Note 분석 결과**(`anoteAnalysis`) — 재조회 시 불변
 - **패턴 카운트**(공황 손절, 조기 익절, 장기 보유 후 손절 등) — UI에서 재계산
 - 다음 분석 요청 시 **누적 학습 건수**를 백엔드에 전달 (`totalTradesLearned`)
+- 투자 성향 **스냅샷 히스토리**(코드/축 점수/체결 건수)로 변화 분석 렌더링
 
 ---
 
@@ -131,8 +135,9 @@ CSS 변수 기준 다크 테마.
 
 ## 10. 로컬 실행
 
-- `start.sh`: 의존성 설치 후 Uvicorn으로 `server:app` 기동
-- 브라우저: `http://localhost:8000/`
+- `start.sh`: Git Bash/WSL/macOS/Linux에서 의존성 설치 후 서버 기동
+- `start.ps1`: Windows PowerShell에서 의존성 설치 후 서버 기동
+- 공통 접속: `http://localhost:8000/`
 
 ---
 

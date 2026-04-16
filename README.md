@@ -10,8 +10,9 @@
 
 - **주문**: 종목별 시세·차트(Chart.js), RSI 등 지표, 매수/매도 시뮬레이션(수량·가격 유효성 검사)
 - **매매 내역**: 체결 기록 누적, 항목별 **A-Note(오답 노트)** — 분석 결과는 저장되어 재조회 시 동일하게 표시
-- **투자 성향**: 누적 체결을 바탕으로 한 MBTI 스타일 프로필 및 유형별 캐릭터
-- **뉴스**: 네이버 뉴스 + Gemini로 요약·시장 영향·관련 섹터·종목 보강(백엔드 API)
+- **투자 성향**: 누적 체결 기반 MBTI 스타일 프로필, 성향 변화 추적, 다음 행동 패턴 추천
+- **오답 노트 2번**: 종목 관련 네이버 뉴스 + Gemini 기반 단기 해석 및 다음 행동 제안
+- **잔고/보유**: 다중 종목 보유를 종목별 수량·평단으로 관리 및 표시
 
 ---
 
@@ -37,7 +38,7 @@
 
 ## 환경 변수
 
-프로젝트 루트에 `.env` 파일을 두고 아래 값을 채웁니다. `start.sh`는 플레이스홀더(`여기에` 등)가 남아 있으면 실행을 중단합니다.
+프로젝트 루트에 `.env` 파일을 두고 아래 값을 채웁니다. `start.sh`/`start.ps1`는 플레이스홀더(`여기에` 등)가 남아 있으면 실행을 중단합니다.
 
 | 변수 | 설명 |
 |------|------|
@@ -62,7 +63,13 @@ chmod +x start.sh
 
 브라우저에서 **http://localhost:8000** 을 엽니다.
 
-### Windows (PowerShell) — 수동 실행
+### Windows (PowerShell)
+
+```powershell
+.\start.ps1
+```
+
+또는 수동 실행:
 
 ```powershell
 pip install -r requirements.txt
@@ -85,6 +92,7 @@ A-Note/
 │   └── requirements.txt
 ├── requirements.txt
 ├── start.sh           # 로컬 기동 스크립트
+├── start.ps1          # Windows PowerShell 기동 스크립트
 ├── vercel.json        # Vercel 빌드·라우팅
 ├── design.md          # 설계 문서
 └── README.md
