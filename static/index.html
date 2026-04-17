@@ -238,6 +238,11 @@ html[data-theme="light"] .theme-switch-thumb {
   grid-template-rows: 1fr;
 }
 
+/* 데스크톱: 래퍼는 레이아웃에 참여하지 않음(자식이 .trade-card 그리드에 직접 배치) */
+.trade-card-scroll {
+  display: contents;
+}
+
 /* 시장 지수 + 종목 탭: 주문 탭에서만 표시 */
 .market-stock-bar {
   grid-column: 1;
@@ -645,10 +650,41 @@ html[data-theme="light"] .hist-item {
     display: flex;
     flex-direction: column;
     gap: var(--stack-gap);
+    overflow: hidden;
+    padding-bottom: 0;
+  }
+  /* 스크롤은 카드 전체가 아니라 본문 래퍼만 — iOS 등에서 fixed 하단탭이 스크롤 영역에 갇기지 않음 */
+  .trade-card-scroll {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
-    padding-bottom: 96px;
+    gap: var(--stack-gap);
+    order: 1;
+  }
+  .tab-panels {
+    order: 2;
+  }
+  .tab-panels.active {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .bottom-tabs {
+    order: 3;
+    position: static !important;
+    flex-shrink: 0;
+    left: auto !important;
+    right: auto !important;
+    bottom: auto !important;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .trade-card.order-hidden .trade-card-scroll {
+    display: none;
   }
   .market-stock-bar,
   .trade-inner,
@@ -714,16 +750,6 @@ html[data-theme="light"] .hist-item {
   background: var(--bg2);
   box-shadow: var(--card-shadow);
   overflow: hidden;
-}
-@media (max-width: 900px) {
-  .bottom-tabs {
-    position: fixed !important;
-    left: 10px;
-    right: 10px;
-    bottom: 10px;
-    margin-top: 0;
-    z-index: 1200;
-  }
 }
 .btab {
   width: 100%;
@@ -1397,6 +1423,8 @@ html[data-theme="light"] .toast {
 
   <!-- ── 왼쪽 카드: 매매 화면 ── -->
   <div class="trade-card">
+    <!-- 데스크톱: display:contents로 그리드 자식 유지 / 모바일: 스크롤 격리(하단탭이 가려지지 않도록) -->
+    <div class="trade-card-scroll">
     <div id="marketStockBar" class="market-stock-bar">
     <div class="ui-card ui-card--pad market-card">
     <!-- 시장 지수 바 -->
@@ -1523,11 +1551,7 @@ html[data-theme="light"] .toast {
       </div>
     </div>
 
-    <div class="bottom-tabs">
-      <button class="btab active" id="tabBtnOrder" onclick="switchBottomTab('order')">주문</button>
-      <button class="btab" id="tabBtnHistory" onclick="switchBottomTab('history')">매매 내역</button>
-      <button class="btab" id="tabBtnProfile" onclick="switchBottomTab('profile')">투자 성향</button>
-    </div>
+    </div><!-- /.trade-card-scroll -->
 
     <div class="tab-panels">
       <div class="tab-panel active" id="tabPanelOrder"></div>
@@ -1544,6 +1568,12 @@ html[data-theme="light"] .toast {
       <div class="tab-panel" id="tabPanelProfile">
         <div class="profile-wrap ui-card ui-card--pad" id="investorProfile"></div>
       </div>
+    </div>
+
+    <div class="bottom-tabs">
+      <button class="btab active" id="tabBtnOrder" onclick="switchBottomTab('order')">주문</button>
+      <button class="btab" id="tabBtnHistory" onclick="switchBottomTab('history')">매매 내역</button>
+      <button class="btab" id="tabBtnProfile" onclick="switchBottomTab('profile')">투자 성향</button>
     </div>
   </div>
 </div>
