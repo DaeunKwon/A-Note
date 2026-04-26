@@ -2405,7 +2405,7 @@ function generateAnalysis(record) {
   const pnl     = record.pnl ?? 0;
   const isLoss  = pnl < 0;
   const pnlPct  = record.avgPrice ? ((record.price - record.avgPrice) / record.avgPrice * 100).toFixed(1) : null;
-  const learned = tradeHistory.length;
+  const learned = countTradesStrictlyBefore(record) + 1;
 
   let timingScore, riskScore, contextScore;
   if (isBuy) {
@@ -2471,6 +2471,36 @@ function generateAnalysis(record) {
   };
 }
 
+/** 체결 시각·id 기준 정렬용 키 (오래된 것이 작은 값). 날짜 없는 기록은 id(타임스탬프)에 의존 */
+function tradeChronologicalKey(t) {
+  if (t && typeof t.time === 'string' && t.time !== '(복구)') {
+    const s = t.time.trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2}):(\d{2})/);
+    if (m) {
+      const iso = `${m[1]}T${String(m[2]).padStart(2, '0')}:${m[3]}:${m[4]}`;
+      const ms = Date.parse(iso);
+      if (!Number.isNaN(ms)) return ms;
+    }
+  }
+  const idn = Number(t && t.id);
+  return Number.isFinite(idn) ? idn : 0;
+}
+
+/** 열람 중인 체결보다 시간상 앞선(이전) 매수·매도 건수 */
+function countTradesStrictlyBefore(target) {
+  const tid = String(target.id);
+  const tKey = tradeChronologicalKey(target);
+  const tIdNum = Number(target.id);
+  let c = 0;
+  for (const t of tradeHistory) {
+    if (String(t.id) === tid) continue;
+    const k = tradeChronologicalKey(t);
+    if (k < tKey) c++;
+    else if (k === tKey && Number(t.id) < tIdNum) c++;
+  }
+  return c;
+}
+
 // ── 오답 노트 모달 열기 ──
 function openAnote(id) {
   const record = tradeHistory.find(t => t.id === id || String(t.id) === String(id));
@@ -2533,28 +2563,39 @@ function openAnote(id) {
   overlay.addEventListener('click', e => { if(e.target===overlay) closeAnote(); });
   document.body.appendChild(overlay);
 
-  const totalLearn = Math.max(1, tradeHistory.length);
+  const priorCount = countTradesStrictlyBefore(record);
+  /** 이 체결 시점까지의 순번(1부터). 서버·오프라인 분석 맥락용 */
+  const contextualLearned = priorCount + 1;
   let shown = 0;
   const loadingTextEl = () => document.getElementById('anoteLoadingText');
-  const stepMs = Math.max(90, Math.min(280, Math.floor(850 / totalLearn)));
-  const countTick = setInterval(() => {
-    shown = Math.min(shown + 1, totalLearn);
+  let countTick = null;
+  if (priorCount > 0) {
+    const stepMs = Math.max(90, Math.min(280, Math.floor(850 / priorCount)));
+    countTick = setInterval(() => {
+      shown = Math.min(shown + 1, priorCount);
+      const el = loadingTextEl();
+      if (el) el.textContent = `이전 ${shown}건의 매매 내역을 바탕으로 분석 중...`;
+      if (shown >= priorCount) clearInterval(countTick);
+    }, stepMs);
+  } else {
     const el = loadingTextEl();
-    if (el) el.textContent = `과거 ${shown}건 매매 데이터를 바탕으로 분석 중...`;
-    if (shown >= totalLearn) clearInterval(countTick);
-  }, stepMs);
+    if (el) el.textContent = '이전 매매 내역 없이 분석 중...';
+  }
 
-  const analyzeDelay = Math.min(1100 + totalLearn * 40, 2400);
+  const analyzeDelay = Math.min(1100 + Math.max(priorCount, 1) * 40, 2400);
 
   setTimeout(async () => {
-    clearInterval(countTick);
+    if (countTick) clearInterval(countTick);
     const el = loadingTextEl();
-    if (el) el.textContent = `과거 ${totalLearn}건 매매 데이터를 바탕으로 분석 중...`;
+    if (el) {
+      if (priorCount === 0) el.textContent = '이전 매매 내역 없이 분석 중...';
+      else el.textContent = `이전 ${priorCount}건의 매매 내역을 바탕으로 분석 중...`;
+    }
 
     const loadingEl = document.getElementById('anoteLoading');
     if (!loadingEl) return;
     recomputePatternCounts();
-    const totalTradesLearned = tradeHistory.length;
+    const totalTradesLearned = contextualLearned;
 
     const finish = (analysis) => {
       record.anoteAnalysis = analysis;

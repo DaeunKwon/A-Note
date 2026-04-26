@@ -13,6 +13,7 @@
 - **투자 성향**: 누적 체결 기반 MBTI 스타일 프로필, 성향 변화 추적, 다음 행동 패턴 추천
 - **오답 노트 2번**: 종목 관련 네이버 뉴스 + Gemini 기반 단기 해석 및 다음 행동 제안
 - **잔고/보유**: 다중 종목 보유를 종목별 수량·평단으로 관리 및 표시
+- **모바일 프리뷰**: `/m` 또는 `/mobile`에서 앱형 모바일 UI 미리보기 제공
 
 ---
 
@@ -21,7 +22,7 @@
 | 구분 | 내용 |
 |------|------|
 | 백엔드 | Python, FastAPI, httpx, uvicorn |
-| 프론트엔드 | 단일 `static/index.html` (바닐라 JS), Chart.js |
+| 프론트엔드 | `static/index.html` (바닐라 JS), Chart.js, 정적 UI 프리뷰 HTML |
 | AI | Google Gemini (`gemini-2.5-flash`) |
 | 배포 (선택) | Vercel — `api/index.py`, `vercel.json` |
 
@@ -72,11 +73,11 @@ chmod +x start.sh
 또는 수동 실행:
 
 ```powershell
-pip install -r requirements.txt
-python server.py
+python -m pip install -r .\Requirements.txt
+python -m uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-`server.py`는 내부에서 uvicorn으로 앱을 띄우도록 구성되어 있습니다.
+`start.ps1`은 8000 포트를 점유한 기존 서버 프로세스와 잔여 `server.py` 프로세스를 정리한 뒤 uvicorn으로 앱을 실행합니다. `server.py`를 직접 실행할 수도 있으며, Windows에서는 reload를 끄고 실행되도록 구성되어 있습니다.
 
 ---
 
@@ -86,11 +87,13 @@ python server.py
 A-Note/
 ├── server.py          # FastAPI 앱, REST·정적 파일·WebSocket
 ├── static/
-│   └── index.html     # 프론트엔드 UI
+│   ├── index.html                  # 메인 프론트엔드 UI
+│   ├── mobile-app-preview.html     # /m, /mobile 모바일 앱형 프리뷰
+│   └── order-tab-card-preview.html # 주문 탭 카드형 UI 프리뷰
 ├── api/
 │   ├── index.py       # Vercel 진입점 (from server import app)
 │   └── requirements.txt
-├── requirements.txt
+├── Requirements.txt
 ├── start.sh           # 로컬 기동 스크립트
 ├── start.ps1          # Windows PowerShell 기동 스크립트
 ├── vercel.json        # Vercel 빌드·라우팅
@@ -104,7 +107,7 @@ A-Note/
 
 1. 저장소를 Vercel에 연결합니다.
 2. 환경 변수에 위 `.env` 항목을 동일하게 설정합니다.
-3. `vercel.json`이 `static/**`를 포함하도록 구성되어 있어야 정상적으로 `index.html`이 서빙됩니다.
+3. `vercel.json`이 `static/**`를 포함하도록 구성되어 있어야 메인 화면과 `/m` 모바일 프리뷰가 정상 서빙됩니다.
 
 **참고**: 서버리스 환경에서는 **WebSocket**(`/ws/prices`)이 기대대로 동작하지 않을 수 있습니다. 시세는 HTTP 폴링 등으로 보완하는 것이 안전합니다.
 

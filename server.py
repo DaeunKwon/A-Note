@@ -38,10 +38,21 @@ if not logger.handlers:
 
 def _stderr_log_news_gemini(trade_name: str, err: BaseException) -> None:
     """uvicorn 로깅과 무관하게 터미널에 원인 출력."""
-    sys.stderr.write(f"\n[A-Note] 뉴스 Gemini 실패 — 종목: {trade_name}\n")
-    sys.stderr.write(f"  {type(err).__name__}: {err}\n")
-    traceback.print_exc(file=sys.stderr)
-    sys.stderr.flush()
+    try:
+        # Windows 콘솔(cp949) 등에서도 로그 출력 실패가 API 오류로 번지지 않도록 방어
+        msg1 = f"\n[A-Note] 뉴스 Gemini 실패 - 종목: {trade_name}\n".encode(
+            sys.stderr.encoding or "utf-8", errors="replace"
+        ).decode(sys.stderr.encoding or "utf-8", errors="replace")
+        msg2 = f"  {type(err).__name__}: {err}\n".encode(
+            sys.stderr.encoding or "utf-8", errors="replace"
+        ).decode(sys.stderr.encoding or "utf-8", errors="replace")
+        sys.stderr.write(msg1)
+        sys.stderr.write(msg2)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+    except Exception:
+        # logging 실패로 요청 자체가 500으로 끝나지 않게 무시
+        pass
 
 app = FastAPI(title="A-Note API")
 
@@ -465,6 +476,45 @@ def _fallback_news_actions(
     }
 
 
+def _gemini_candidate_text(candidate: dict) -> str:
+    """모델이 본문을 여러 parts로 쪼갠 경우까지 이어붙여 한 문자열로 만든다."""
+    parts = (candidate.get("content") or {}).get("parts") or []
+    chunks: List[str] = []
+    for p in parts:
+        if isinstance(p, dict):
+            t = p.get("text")
+            if isinstance(t, str) and t:
+                chunks.append(t)
+    return "".join(chunks).strip()
+
+
+def _pad_anote_news_actions(trade: TradeRecord, clean_actions: List[dict]) -> List[dict]:
+    """모델이 newsActions를 덜 채운 경우 복기용 기본 항목으로 3개까지 맞춘다."""
+    pool = [
+        {
+            "title": "아래 기사 원문 읽기",
+            "desc": "제목만 보고 판단하지 말고, 링크에서 전체 맥락을 확인해 보세요.",
+        },
+        {
+            "title": "뉴스와 차트 시점 맞추기",
+            "desc": f"이번 체결 시점({trade.tradeTime}) 전후로 주가·거래량 변화를 다시 보면 패턴이 보입니다.",
+        },
+        {
+            "title": "규칙대로만 추가 매매",
+            "desc": "호재·악재에 휘둘리지 말고, 미리 정한 손절·익절선을 우선하세요.",
+        },
+    ]
+    out = list(clean_actions)
+    titles_seen = {(x.get("title") or "") for x in out}
+    for p in pool:
+        if len(out) >= 3:
+            break
+        if p["title"] not in titles_seen:
+            out.append(dict(p))
+            titles_seen.add(p["title"])
+    return out[:3]
+
+
 def _parse_news_json_from_model_text(raw: str) -> dict:
     """모델이 마크다운·앞뒤 잡담과 섞어 보낸 경우까지 완화적으로 JSON만 추출."""
     t = (raw or "").strip()
@@ -537,18 +587,57 @@ async def gemini_news_recommendation(trade: TradeRecord, items: List[dict]) -> d
 - newsActions 3개 미만
 """
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.35,
-                    "maxOutputTokens": 1536,
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    )
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    gen_structured = {
+        "temperature": 0.35,
+        "maxOutputTokens": 2048,
+        "responseMimeType": "application/json",
+        "responseSchema": {
+            "type": "object",
+            "properties": {
+                "newsOutlook": {"type": "string"},
+                "newsActions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "desc": {"type": "string"},
+                        },
+                        "required": ["title", "desc"],
+                    },
                 },
             },
-            timeout=45,
-        )
+            "required": ["newsOutlook", "newsActions"],
+        },
+    }
+    gen_legacy = {
+        "temperature": 0.35,
+        "maxOutputTokens": 2048,
+    }
+
+    async def _post(gen_cfg: dict) -> httpx.Response:
+        async with httpx.AsyncClient() as client:
+            return await client.post(
+                url,
+                json={**body, "generationConfig": gen_cfg},
+                timeout=45,
+            )
+
+    gen_cfg = gen_structured
+    r = await _post(gen_cfg)
+    if r.status_code == 400:
+        gen_cfg = gen_legacy
+        r = await _post(gen_cfg)
+    for attempt in range(2):
+        if r.status_code not in (429, 503):
+            break
+        await asyncio.sleep(1.5 * (attempt + 1))
+        r = await _post(gen_cfg)
     try:
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
@@ -572,22 +661,21 @@ async def gemini_news_recommendation(trade: TradeRecord, items: List[dict]) -> d
             "Gemini가 본문을 반환하지 않았습니다(SAFETY 등). "
             f"finishReason={fr!r} candidate={json.dumps(cand0, ensure_ascii=False)[:900]}"
         )
-    raw = (parts[0].get("text") or "").strip()
+    raw = _gemini_candidate_text(cand0)
     data = _parse_news_json_from_model_text(raw)
     outlook = (data.get("newsOutlook") or "").strip()
     acts = data.get("newsActions")
-    if not outlook or not isinstance(acts, list) or len(acts) < 3:
+    if not outlook or not isinstance(acts, list):
         raise ValueError("invalid news AI shape")
     clean_actions = []
-    for a in acts[:5]:
+    for a in acts[:8]:
         if not isinstance(a, dict):
             continue
         t = (a.get("title") or "").strip()
         d = (a.get("desc") or "").strip()
         if t and d:
             clean_actions.append({"title": t[:80], "desc": d[:400]})
-    if len(clean_actions) < 3:
-        raise ValueError("not enough actions")
+    clean_actions = _pad_anote_news_actions(trade, clean_actions)
     return {
         "newsOutlook": outlook[:2000],
         "newsActions": clean_actions[:3],
@@ -601,8 +689,14 @@ async def gemini_news_recommendation_safe(trade: TradeRecord, items: List[dict])
     try:
         return await gemini_news_recommendation(trade, items)
     except Exception as e:
-        _stderr_log_news_gemini(tname, e)
-        logger.warning("뉴스 기반 Gemini 분석 실패 (%s): %s", tname, e, exc_info=True)
+        try:
+            _stderr_log_news_gemini(tname, e)
+        except Exception:
+            pass
+        try:
+            logger.warning("뉴스 기반 Gemini 분석 실패 (%s): %s", tname, e, exc_info=True)
+        except Exception:
+            pass
         if GEMINI_API_KEY:
             return _fallback_news_actions(trade, items, gemini_status="failed")
         return _fallback_news_actions(trade, items, gemini_status="missing")
@@ -758,13 +852,22 @@ async def analyze_trade(trade: TradeRecord):
     except Exception:
         main = _fallback_analysis(trade, pnl_pct)
 
-    news_items = await fetch_naver_news_raw(f"{trade.stockName} 주식", display=8)
-    news_block = await gemini_news_recommendation_safe(trade, news_items)
+    try:
+        news_items = await fetch_naver_news_raw(f"{trade.stockName} 주식", display=8)
+        news_block = await gemini_news_recommendation_safe(trade, news_items)
+    except Exception:
+        # 외부 API/로깅/인코딩 이슈가 있어도 프론트가 "서버 연결 실패"로 가지 않게 보호
+        news_items = []
+        news_block = _fallback_news_actions(trade, [], gemini_status="failed")
 
     news_block["newsFetchedAt"] = datetime.now().isoformat(timespec="seconds")
     if isinstance(main, dict):
         main.update(news_block)
-    return main
+        return main
+    fallback_main = _fallback_analysis(trade, pnl_pct)
+    if isinstance(fallback_main, dict):
+        fallback_main.update(news_block)
+    return fallback_main
 
 
 def _fallback_analysis(trade: TradeRecord, pnl_pct):
@@ -847,6 +950,23 @@ async def root():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+@app.get("/m")
+@app.get("/mobile")
+async def mobile_root():
+    if not STATIC_DIR.exists():
+        raise HTTPException(
+            status_code=500,
+            detail="static directory not found in deployment bundle",
+        )
+    mobile_entry = STATIC_DIR / "mobile-app-preview.html"
+    if not mobile_entry.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="mobile entry file not found: static/mobile-app-preview.html",
+        )
+    return FileResponse(str(mobile_entry))
+
+
 # ── 웹소켓: 실시간 시세 스트림 ───────────────────────
 class ConnectionManager:
     def __init__(self):
@@ -892,4 +1012,6 @@ async def ws_prices(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    # Windows 환경에서 reload 프로세스가 중복/충돌을 유발해 /api/analyze가 간헐 500으로 떨어지는 사례 방지
+    use_reload = os.name != "nt"
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=use_reload)
